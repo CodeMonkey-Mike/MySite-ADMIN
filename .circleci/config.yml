@@ -1,0 +1,220 @@
+version: 2.1
+orbs:
+  slack: circleci/slack@4.4.0
+machine: &machine
+  machine:
+      image: ubuntu-2004:202111-02
+
+jobs:
+  dep:
+    <<: *machine
+    steps:
+      - checkout
+      - run:
+          name: Install Yarn
+          command: |
+            curl -o- -L https://yarnpkg.com/install.sh | bash
+            echo 'export PATH="$HOME/.yarn/bin:$HOME/.config/yarn/global/node_modules/.bin:$PATH"' >> $BASH_ENV
+      - run:
+          name: Install Dependencies
+          command: yarn install
+      - save_cache:
+          key: yarn-deps-{{ .Branch }}-{{ checksum "yarn.lock" }}
+          paths:
+            - node_modules
+  check:
+    <<: *machine
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+          - yarn-deps-{{ .Branch }}-{{ checksum "yarn.lock" }}
+          - yarn-deps-{{ .Branch }}-
+          - yarn-deps-
+      - run:
+          name: Lint 
+          command: npm run lint
+      - run:
+          name: Test 
+          command: npm run test
+  deploy_dev_staging:
+     <<: *machine
+     steps:
+      - checkout
+      - restore_cache:
+          keys:
+          - yarn-deps-{{ .Branch }}-{{ checksum "yarn.lock" }}
+          - yarn-deps-{{ .Branch }}-
+          - yarn-deps-
+      - run:
+          name: Install OpenVPN
+          command: |
+            sudo apt-get update
+            sudo apt-get install openvpn openvpn-systemd-resolved
+      - run:
+          name: VPN Setup
+          background: true
+          command: |
+            echo $VPN_STAGING | base64 --decode > /tmp/config.ovpn
+            printf "dominitech\n$VPN_PASSWORD" > /tmp/vpn.login
+            sudo openvpn --config /tmp/config.ovpn --auth-user-pass /tmp/vpn.login \
+              --route $phone_home 255.255.255.255 net_gateway \
+              --route 169.254.0.0 255.255.0.0 net_gateway \
+              --pull-filter ignore redirect-gateway \
+              --pull-filter ignore "dhcp-option DNS"
+      - run:
+          name: Wait for the connection to be established
+          command: sleep 30
+      - run:
+          name: Install sshpass
+          command: |
+            sudo apt-get update
+            sudo apt-get install sshpass
+      - run:
+          name: Build
+          command: npm run build
+      - run:
+          name: Zip node pkgs
+          command: |
+            zip -r .next.zip .next
+            zip -r --symlinks node_modules.zip node_modules
+      - run:
+          name: Copy resources to server
+          command: |
+            if [ -n "$CIRCLE_PULL_REQUEST" ]; then
+              CI_PR=$( echo $CIRCLE_PULL_REQUEST | rev | cut -d '/' -f1 | rev )
+              /usr/bin/sshpass -p "$VPN_PASSWORD" ssh $SSH_USER@$SSH_HOST "mkdir -p workspace/mikeneder.me/mikeneder-admin/$CI_PR"
+              /usr/bin/sshpass -p "$VPN_PASSWORD" scp node_modules.zip $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin/$CI_PR
+              /usr/bin/sshpass -p "$VPN_PASSWORD" scp package.json $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin/$CI_PR
+              /usr/bin/sshpass -p "$VPN_PASSWORD" scp .next.zip $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin/$CI_PR
+              /usr/bin/sshpass -p "$VPN_PASSWORD" scp -r scripts $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin/$CI_PR
+            else
+              /usr/bin/sshpass -p "$VPN_PASSWORD" ssh $SSH_USER@$SSH_HOST "mkdir -p workspace/mikeneder.me/mikeneder-admin/master"
+              /usr/bin/sshpass -p "$VPN_PASSWORD" scp node_modules.zip $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin/master
+              /usr/bin/sshpass -p "$VPN_PASSWORD" scp package.json $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin/master
+              /usr/bin/sshpass -p "$VPN_PASSWORD" scp .next.zip $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin/master
+              /usr/bin/sshpass -p "$VPN_PASSWORD" scp -r scripts $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin/master
+            fi
+      - run:
+          name: Start PM2
+          command: |
+            if [ -n "$CIRCLE_PULL_REQUEST" ]; then
+              CI_PR=$( echo $CIRCLE_PULL_REQUEST | rev | cut -d '/' -f1 | rev )
+              /usr/bin/sshpass -p "$VPN_PASSWORD" ssh $SSH_USER@$SSH_HOST "cd workspace/mikeneder.me/mikeneder-admin/$CI_PR && node ./scripts/deploy_dev.js $CIRCLE_SHA1 $CIRCLE_PULL_REQUEST $VPN_PASSWORD"
+            else
+              /usr/bin/sshpass -p "$VPN_PASSWORD" ssh $SSH_USER@$SSH_HOST "cd workspace/mikeneder.me/mikeneder-admin/master && unzip -qq node_modules.zip -d ~/workspace/mikeneder.me/mikeneder-admin/master && node ./scripts/deploy_staging.js $VPN_PASSWORD $AUTH_TOKEN $CIRCLE_PROJECT_USERNAME $CIRCLE_PROJECT_REPONAME $CIRCLE_BUILD_NUM"
+            fi
+             
+      - run:
+          name: Disconnect from OpenVPN
+          command: sudo killall openvpn || true
+          when: always
+      - run:
+          name: remove OpenVPN config
+          command: |
+            sudo rm /tmp/config.ovpn
+            sudo rm /tmp/vpn.login
+  deploy_prod:
+     <<: *machine
+     steps:
+      - checkout
+      - restore_cache:
+          keys:
+          - yarn-deps-{{ .Branch }}-{{ checksum "yarn.lock" }}
+          - yarn-deps-{{ .Branch }}-
+          - yarn-deps-
+      - run:
+          name: Install OpenVPN
+          command: |
+            sudo apt-get update
+            sudo apt-get install openvpn openvpn-systemd-resolved
+      - run:
+          name: VPN Setup
+          background: true
+          command: |
+            echo $VPN_PROD | base64 --decode > /tmp/config.ovpn
+            printf "dominitech\n$VPN_PASSWORD" > /tmp/vpn.login
+            sudo openvpn --config /tmp/config.ovpn --auth-user-pass /tmp/vpn.login \
+              --route $phone_home 255.255.255.255 net_gateway \
+              --route 169.254.0.0 255.255.0.0 net_gateway \
+              --pull-filter ignore redirect-gateway \
+              --pull-filter ignore "dhcp-option DNS"
+      - run:
+          name: Wait for the connection to be established
+          command: sleep 30
+      - run:
+          name: Install sshpass
+          command: |
+            sudo apt-get update
+            sudo apt-get install sshpass
+      - run:
+          name: Build
+          command: |
+            echo "NEXT_PUBLIC_API_URL=https://api" | tee '.env'
+            npm run build
+      - run:
+          name: Zip node pkgs
+          command: |
+            zip -r .next.zip .next
+            zip -r --symlinks node_modules.zip node_modules
+      - run:
+          name: Copy resources to server
+          command: |
+            /usr/bin/sshpass -p "$VPN_PASSWORD" scp node_modules.zip $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin
+            /usr/bin/sshpass -p "$VPN_PASSWORD" scp package.json $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin
+            /usr/bin/sshpass -p "$VPN_PASSWORD" scp .next.zip $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin
+            /usr/bin/sshpass -p "$VPN_PASSWORD" scp -r scripts $SSH_USER@$SSH_HOST:/home/dominitech/workspace/mikeneder.me/mikeneder-admin
+      - run:
+          name: Deploy Production
+          command: |
+            /usr/bin/sshpass -p "$VPN_PASSWORD" ssh $SSH_USER@$SSH_HOST "cd workspace/mikeneder.me/mikeneder-admin && node ./scripts/deploy_prod.js $VPN_PASSWORD $CIRCLE_TAG"
+      - run:
+          name: Disconnect from OpenVPN
+          command: sudo killall openvpn || true
+          when: always
+      - run:
+          name: remove OpenVPN config
+          command: |
+            sudo rm /tmp/config.ovpn
+            sudo rm /tmp/vpn.login
+      - slack/notify:
+          event: fail
+          template: basic_fail_1
+      - slack/notify:
+          event: pass
+          template: success_tagged_deploy_1
+workflows:
+   version: 2
+   build-and-deploy:
+     jobs: 
+       - dep:
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              only: /v[0-9]+(\.[0-9]+)*/
+       - check:
+          requires:
+          - dep
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              ignore: /.*/
+       - deploy_dev_staging:
+          requires:
+          - dep
+          - check
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              ignore: /.*/
+       - deploy_prod:
+          requires:
+            - dep
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /v[0-9]+(\.[0-9]+)*/
